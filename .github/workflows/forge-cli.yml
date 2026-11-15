@@ -1,0 +1,143 @@
+# Builds Mitsumi Forge's terminal app (`forge`) for Windows, macOS and Linux,
+# attaches the archives and checksums to this repository's release, and
+# publishes the npm packages (`npm install -g mitsumi-forge`).
+#
+# The source lives in a private repository; it is checked out read-only with
+# SOURCE_TOKEN. Only people with write access here can run this workflow.
+#
+# Secrets (Settings → Secrets and variables → Actions):
+#   SOURCE_TOKEN  read-only token for Mitsumi-Distribution/mitsumi-forge (Contents: read)
+#   NPM_TOKEN     npm granular token, read and write on packages, "bypass 2FA" on
+name: forge-cli
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 0.2.2)"
+        required: true
+      ref:
+        description: "Source branch, tag or commit"
+        default: main
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: Mitsumi-Distribution/mitsumi-forge
+  VERSION: ${{ github.event.inputs.version }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Make sure the release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$VERSION"
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
+            || gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "Mitsumi Forge $VERSION" --notes "Mitsumi Forge $VERSION"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: forge-windows-x64, ext: .exe, npm: win32-x64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: forge-macos-arm64, ext: "", npm: darwin-arm64 }
+          # Built on Apple silicon for Intel Macs.
+          - { os: macos-latest, target: x86_64-apple-darwin, name: forge-macos-x64, ext: "", npm: darwin-x64 }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, name: forge-linux-x64, ext: "", npm: linux-x64 }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ github.event.inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+          key: ${{ matrix.target }}
+      - name: Linux keychain library
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Test
+        # Intel Mac builds are cross-compiled and can't run here.
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test -p forge-cli --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build -p forge-cli --release --target ${{ matrix.target }}
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bin="target/${{ matrix.target }}/release/forge${{ matrix.ext }}"
+          mkdir -p dist
+          cp "$bin" "dist/forge${{ matrix.ext }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            (cd dist && 7z a "../${{ matrix.name }}.zip" forge.exe > /dev/null)
+            archive="${{ matrix.name }}.zip"
+          else
+            (cd dist && tar czf "../${{ matrix.name }}.tar.gz" forge)
+            archive="${{ matrix.name }}.tar.gz"
+          fi
+          gh release upload "v$VERSION" -R "$GITHUB_REPOSITORY" --clobber "$archive"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Publish this platform's npm package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          node npm/build-packages.mjs platform "$VERSION" "${{ matrix.npm }}" "target/${{ matrix.target }}/release/forge${{ matrix.ext }}" npm-out
+          cd "npm-out/mitsumi-forge-${{ matrix.npm }}"
+          # A re-run skips what an earlier attempt already published.
+          npm view "mitsumi-forge-${{ matrix.npm }}@$VERSION" version > /dev/null 2>&1 || npm publish --access public
+
+  finish:
+    needs: build
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ github.event.inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Checksums on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir sums && cd sums
+          gh release download "v$VERSION" -R "$GITHUB_REPOSITORY" -p "forge-*.zip" -p "forge-*.tar.gz"
+          sha256sum forge-* > forge-SHA256SUMS.txt
+          gh release upload "v$VERSION" -R "$GITHUB_REPOSITORY" --clobber forge-SHA256SUMS.txt
+      - name: Publish the npm launcher
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        working-directory: src
+        run: |
+          node npm/build-packages.mjs launcher "$VERSION" npm-out
+          cd npm-out/mitsumi-forge
+          npm view "mitsumi-forge@$VERSION" version > /dev/null 2>&1 || npm publish --access public
